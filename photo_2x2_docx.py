@@ -146,18 +146,12 @@ def set_row_height(row, height_mm):
 def build_docx(image_paths: list, output_path: str,
                cols: int = 2, rows: int = 2,
                progress_cb=None, done_cb=None):
-    """
-    Build a DOCX with images in a cols×rows A4 grid.
-    One page holds cols*rows images.
-    """
     if not HAS_DOCX:
         if done_cb:
             done_cb("python-docx not installed. Run: pip install python-docx")
         return
 
     try:
-        from docx.enum.text import WD_BREAK
-
         doc     = Document()
         section = doc.sections[0]
         section.page_width    = Mm(A4_W_MM)
@@ -170,6 +164,7 @@ def build_docx(image_paths: list, output_path: str,
         style = doc.styles["Normal"]
         style.paragraph_format.space_before = Pt(0)
         style.paragraph_format.space_after  = Pt(0)
+        style.paragraph_format.line_spacing = Pt(12)
 
         cell_w, cell_h = cell_dims(cols, rows)
         per_page       = cols * rows
@@ -182,12 +177,12 @@ def build_docx(image_paths: list, output_path: str,
             table = doc.add_table(rows=rows, cols=cols)
             table.alignment = WD_TABLE_ALIGNMENT.CENTER
             set_table_borders(table)
+            
+            table.allow_autofit = False
 
-            # set column widths
             for col_obj in table.columns:
                 col_obj.width = Mm(cell_w)
 
-            # set row heights
             for row_obj in table.rows:
                 set_row_height(row_obj, cell_h)
 
@@ -195,27 +190,34 @@ def build_docx(image_paths: list, output_path: str,
                 r_idx = i // cols
                 c_idx = i % cols
                 cell  = table.cell(r_idx, c_idx)
+                
+                cell.width = Mm(cell_w)
                 cell.vertical_alignment = WD_ALIGN_VERTICAL.CENTER
                 set_cell_margins(cell, 0, 0, 0, 0)
 
                 para = cell.paragraphs[0]
                 para.alignment = WD_ALIGN_PARAGRAPH.CENTER
+                
+                para.paragraph_format.space_before = Pt(0)
+                para.paragraph_format.space_after  = Pt(0)
+                para.paragraph_format.left_indent  = Pt(0)
+                para.paragraph_format.right_indent = Pt(0)
+                
                 run  = para.add_run()
 
                 if os.path.isfile(img_path):
-                    run.add_picture(img_path, width=Mm(cell_w))
+                    run.add_picture(img_path, width=Mm(cell_w * 0.96))
 
                 if progress_cb:
                     progress_cb(int((page_idx * per_page + i + 1) / total * 90))
 
-            # fill empty trailing cells
             for i in range(len(chunk), per_page):
                 r_idx = i // cols
                 c_idx = i % cols
                 cell  = table.cell(r_idx, c_idx)
+                cell.width = Mm(cell_w)
                 set_cell_margins(cell, 0, 0, 0, 0)
 
-            # page break (not after last page)
             if page_idx < num_pages - 1:
                 pb_para = doc.add_paragraph()
                 pb_para.paragraph_format.space_before = Pt(0)
@@ -235,7 +237,6 @@ def build_docx(image_paths: list, output_path: str,
     except Exception as exc:
         if done_cb:
             done_cb(str(exc))
-
 
 # ─────────────────────────────────────────────────────────────────────────────
 #  Draggable image card widget

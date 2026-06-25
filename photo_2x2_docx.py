@@ -231,6 +231,9 @@ def build_docx(image_paths: list, output_path: str,
         done_count = 0
 
         for page_idx in range(num_pages):
+            if page_idx > 0:
+                doc.add_page_break()
+
             chunk = image_paths[page_idx * per_page : (page_idx + 1) * per_page]
 
             table = doc.add_table(rows=rows, cols=cols)
@@ -242,9 +245,6 @@ def build_docx(image_paths: list, output_path: str,
             for row_obj in table.rows:
                 set_row_height(row_obj, cell_h)
                 set_row_cant_split(row_obj)
-
-            if page_idx > 0:
-                table.cell(0, 0).paragraphs[0].paragraph_format.page_break_before = True
 
             for i, img_path in enumerate(chunk):
                 r_idx = i // cols
@@ -261,6 +261,7 @@ def build_docx(image_paths: list, output_path: str,
                     buf = resize_for_embed(img_path, cell_w, cell_h)
                     if buf:
                         run.add_picture(buf, width=Mm(cell_w), height=Mm(cell_h))
+                        buf.close()
                     else:
                         run.add_picture(img_path, width=Mm(cell_w), height=Mm(cell_h))
 

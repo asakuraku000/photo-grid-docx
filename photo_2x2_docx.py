@@ -2,6 +2,7 @@
 A4 Photo Grid → DOCX Generator
 Layouts: 1x1 (full page), 1x2, 1x3, 2x2, 3x3, 4x4
 - Add images via file dialog or paste path
+- Responsive left-to-right card grid (auto-columns on resize)
 - Drag to reorder before generating
 - Progress bar while building the DOCX
 """
@@ -54,8 +55,10 @@ MARGIN_MM = 10
 GAP_MM    = 3
 
 # DPI used when resizing images before embedding.
-# 200 dpi gives sharp prints while keeping file size small.
 EMBED_DPI = 200
+
+# ── Card / thumbnail sizing ───────────────────────────────────────────────────
+THUMB_SIZE = (110, 110)   # square thumbnails in the responsive card grid
 
 
 def cell_dims(cols: int, rows: int):
@@ -63,9 +66,6 @@ def cell_dims(cols: int, rows: int):
     usable_w = A4_W_MM - MARGIN_MM * 2 - GAP_MM * (cols - 1)
     usable_h = A4_H_MM - MARGIN_MM * 2 - GAP_MM * (rows - 1)
     return usable_w / cols, usable_h / rows
-
-
-THUMB_SIZE = (120, 90)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -78,25 +78,19 @@ def make_thumbnail(path: str):
     try:
         img = Image.open(path)
         img.thumbnail(THUMB_SIZE, Image.LANCZOS)
-        canvas = Image.new("RGB", THUMB_SIZE, (200, 200, 200))
+        bg = Image.new("RGB", THUMB_SIZE, (45, 45, 45))
         ox = (THUMB_SIZE[0] - img.width)  // 2
         oy = (THUMB_SIZE[1] - img.height) // 2
-        canvas.paste(img, (ox, oy))
-        return ImageTk.PhotoImage(canvas)
+        bg.paste(img, (ox, oy))
+        return ImageTk.PhotoImage(bg)
     except Exception:
         return None
 
 
-def resize_for_embed(img_path: str, cell_w_mm: float, cell_h_mm: float) -> BytesIO | None:
+def resize_for_embed(img_path: str, cell_w_mm: float, cell_h_mm: float):
     """
     Resize + CENTER-CROP the image so it fills the cell EXACTLY (cover-fit),
     at EMBED_DPI, then return a JPEG BytesIO buffer.
-
-    This guarantees every photo ends up the exact same cell_w x cell_h size:
-    - no leftover white margin/letterboxing for "short"/odd-aspect photos
-    - no overflow into the row below for tall/portrait photos
-    so all cells stay pantay-pantay regardless of the original photo shape.
-
     Returns None if PIL is unavailable or on any error (caller falls back).
     """
     if not HAS_PIL:
@@ -106,9 +100,6 @@ def resize_for_embed(img_path: str, cell_w_mm: float, cell_h_mm: float) -> Bytes
         target_h = max(1, int(round(cell_h_mm / 25.4 * EMBED_DPI)))
 
         with Image.open(img_path) as img:
-            # Respect EXIF orientation (phone photos are often stored
-            # "sideways" with rotation metadata — without this, some photos
-            # come out unexpectedly tall/short after resizing).
             try:
                 from PIL import ImageOps
                 img = ImageOps.exif_transpose(img)
@@ -119,9 +110,6 @@ def resize_for_embed(img_path: str, cell_w_mm: float, cell_h_mm: float) -> Bytes
                 img = img.convert("RGB")
 
             src_w, src_h = img.size
-            # Scale so the image fully COVERS the target box, then crop the
-            # overhang from the center — this is what removes both the
-            # margin (contain-fit) and the overflow (width-only stretch).
             scale  = max(target_w / src_w, target_h / src_h)
             new_w  = max(target_w, int(math.ceil(src_w * scale)))
             new_h  = max(target_h, int(math.ceil(src_h * scale)))
@@ -199,8 +187,7 @@ def set_row_height(row, height_mm):
 
 
 def set_row_cant_split(row):
-    """Prevent a table row from being split across two pages, so the whole
-    grid for a page is always kept together as one block."""
+    """Prevent a table row from being split across two pages."""
     tr   = row._tr
     trPr = tr.find(qn("w:trPr"))
     if trPr is None:
@@ -241,7 +228,7 @@ def build_docx(image_paths: list, output_path: str,
         total          = len(image_paths)
         num_pages      = math.ceil(total / per_page)
 
-        done_count = 0  # tracks images fully processed for progress
+        done_count = 0
 
         for page_idx in range(num_pages):
             chunk = image_paths[page_idx * per_page : (page_idx + 1) * per_page]
@@ -256,14 +243,6 @@ def build_docx(image_paths: list, output_path: str,
                 set_row_height(row_obj, cell_h)
                 set_row_cant_split(row_obj)
 
-            # Force this table onto a fresh page instead of inserting a
-            # manual page-break paragraph after the previous table. A manual
-            # break paragraph needs its own line of space; since the table
-            # already fills the whole usable page height, that paragraph had
-            # nowhere to go and was pushed onto its own page by itself,
-            # producing a stray blank page after every table. Setting
-            # page_break_before on the first cell's paragraph instead costs
-            # no extra vertical space, so no blank page is created.
             if page_idx > 0:
                 table.cell(0, 0).paragraphs[0].paragraph_format.page_break_before = True
 
@@ -279,21 +258,14 @@ def build_docx(image_paths: list, output_path: str,
                 run  = para.add_run()
 
                 if os.path.isfile(img_path):
-                    # Resize + center-crop image to the EXACT cell size
-                    # before embedding (cover-fit). This keeps memory low
-                    # and file size manageable for 40+ photos, and makes
-                    # every photo render at identical, non-distorted size.
                     buf = resize_for_embed(img_path, cell_w, cell_h)
                     if buf:
                         run.add_picture(buf, width=Mm(cell_w), height=Mm(cell_h))
                     else:
-                        # PIL unavailable — embed original, forcing it to
-                        # the cell box so it at least can't overflow.
                         run.add_picture(img_path, width=Mm(cell_w), height=Mm(cell_h))
 
                 done_count += 1
                 if progress_cb:
-                    # Reserve 0-85 % for image embedding, 85-95 for save
                     pct = int(done_count / total * 85)
                     progress_cb(pct)
 
@@ -303,9 +275,6 @@ def build_docx(image_paths: list, output_path: str,
                 c_idx = i % cols
                 cell  = table.cell(r_idx, c_idx)
                 set_cell_margins(cell, 0, 0, 0, 0)
-
-            # (page break to the next table is now handled via
-            # page_break_before on that table's first cell — see above)
 
         if progress_cb:
             progress_cb(90)
@@ -323,86 +292,102 @@ def build_docx(image_paths: list, output_path: str,
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  Draggable image card widget
+#  Draggable image card widget  — compact: thumbnail + number only
 # ─────────────────────────────────────────────────────────────────────────────
 
 class ImageCard(tk.Frame):
-    def __init__(self, master, path: str, index: int,
-                 on_drag_end=None, on_delete=None, **kw):
-        super().__init__(master, relief="raised", bd=1,
-                         bg="#2b2b2b", cursor="hand2", **kw)
-        self.path        = path
-        self.index       = index
-        self.on_drag_end = on_drag_end
-        self.on_delete   = on_delete
-        self._drag_start_y = 0
+    CARD_W = 126        # fixed card width  (px)
+    CARD_H = 148        # fixed card height (px)
+    DRAG_THRESHOLD = 6  # px before a press becomes a drag
 
+    def __init__(self, master, path: str, index: int,
+                 on_drag_start=None, on_drag_move=None, on_drag_end=None,
+                 on_delete=None, **kw):
+        super().__init__(master, relief="raised", bd=1,
+                         bg="#2b2b2b", cursor="hand2",
+                         width=self.CARD_W, height=self.CARD_H, **kw)
+        self.pack_propagate(False)   # keep fixed card size
+
+        self.path          = path
+        self.index         = index
+        self.on_drag_start = on_drag_start
+        self.on_drag_move  = on_drag_move
+        self.on_drag_end   = on_drag_end
+        self.on_delete     = on_delete
+
+        self._drag_start_x  = 0
+        self._drag_start_y  = 0
+        self._grab_offset_x = 0
+        self._grab_offset_y = 0
+        self._dragging      = False
+
+        # ── thumbnail ─────────────────────────────────────────────────────────
         self.thumb = make_thumbnail(path)
         if self.thumb:
             img_lbl = tk.Label(self, image=self.thumb, bg="#2b2b2b")
-            img_lbl.pack(side="left", padx=4, pady=4)
+            img_lbl.pack(padx=3, pady=(8, 2))
         else:
-            tk.Label(self, text="🖼", font=("Arial", 28), bg="#2b2b2b",
-                     fg="#aaaaaa").pack(side="left", padx=8, pady=4)
+            img_lbl = tk.Label(self, text="🖼", font=("Arial", 32),
+                               bg="#2b2b2b", fg="#aaaaaa")
+            img_lbl.pack(padx=4, pady=(10, 2))
 
-        info = tk.Frame(self, bg="#2b2b2b")
-        info.pack(side="left", fill="both", expand=True, padx=4)
-
-        self.num_lbl = tk.Label(info, text=f"#{index+1}",
-                                font=("Arial", 11, "bold"),
+        # ── number label ──────────────────────────────────────────────────────
+        self.num_lbl = tk.Label(self, text=f"#{index + 1}",
+                                font=("Arial", 10, "bold"),
                                 bg="#2b2b2b", fg="#f0c040")
-        self.num_lbl.pack(anchor="w")
+        self.num_lbl.pack(pady=(0, 6))
 
-        name = os.path.basename(path)
-        if len(name) > 34:
-            name = name[:31] + "…"
-        tk.Label(info, text=name, font=("Arial", 9),
-                 bg="#2b2b2b", fg="#cccccc",
-                 wraplength=200, justify="left").pack(anchor="w")
-        tk.Label(info, text=path, font=("Arial", 7),
-                 bg="#2b2b2b", fg="#888888",
-                 wraplength=200, justify="left").pack(anchor="w")
+        # ── small delete button overlaid in top-right corner ──────────────────
+        del_btn = tk.Button(self, text="✕", font=("Arial", 7, "bold"),
+                            bg="#c0392b", fg="white", relief="flat",
+                            padx=3, pady=1, cursor="hand2",
+                            activebackground="#e74c3c", activeforeground="white",
+                            command=self._on_delete_click)
+        del_btn.place(relx=1.0, x=-2, y=2, anchor="ne")
 
-        right = tk.Frame(self, bg="#2b2b2b")
-        right.pack(side="right", padx=6, pady=4)
-
-        tk.Button(right, text="✕", font=("Arial", 10, "bold"),
-                  bg="#c0392b", fg="white", relief="flat",
-                  padx=6, pady=3, cursor="hand2",
-                  activebackground="#e74c3c", activeforeground="white",
-                  command=self._on_delete_click).pack(side="top", pady=(0, 4))
-
-        tk.Label(right, text="⠿", font=("Arial", 18),
-                 bg="#2b2b2b", fg="#555555").pack(side="top")
-
-        drag_targets = [self, info]
-        if self.thumb:
-            drag_targets.append(img_lbl)
-        for w in drag_targets:
+        # ── drag bindings on card body, image, and number ─────────────────────
+        for w in (self, img_lbl, self.num_lbl):
             w.bind("<ButtonPress-1>",   self._on_press)
             w.bind("<B1-Motion>",       self._on_motion)
             w.bind("<ButtonRelease-1>", self._on_release)
+
+    # ── event handlers ────────────────────────────────────────────────────────
 
     def _on_delete_click(self):
         if self.on_delete:
             self.on_delete(self)
 
     def _on_press(self, e):
-        self._drag_start_y = e.y_root
+        self._drag_start_x  = e.x_root
+        self._drag_start_y  = e.y_root
+        self._grab_offset_x = e.x
+        self._grab_offset_y = e.y
+        self._dragging      = False
         self.config(relief="sunken")
 
     def _on_motion(self, e):
-        if abs(e.y_root - self._drag_start_y) > 10:
-            self.config(relief="flat", bg="#3a3a3a")
+        if not self._dragging:
+            dx = abs(e.x_root - self._drag_start_x)
+            dy = abs(e.y_root - self._drag_start_y)
+            if max(dx, dy) < self.DRAG_THRESHOLD:
+                return
+            self._dragging = True
+            self.config(relief="raised", bg="#3d6e91")
+            if self.on_drag_start:
+                self.on_drag_start(self, self._grab_offset_x, self._grab_offset_y)
+        if self.on_drag_move:
+            self.on_drag_move(self, e.x_root, e.y_root)
 
     def _on_release(self, e):
         self.config(relief="raised", bg="#2b2b2b")
-        if self.on_drag_end:
-            self.on_drag_end(self, e.y_root)
+        was_dragging  = self._dragging
+        self._dragging = False
+        if was_dragging and self.on_drag_end:
+            self.on_drag_end(self, e.x_root, e.y_root)
 
     def set_index(self, idx: int):
         self.index = idx
-        self.num_lbl.config(text=f"#{idx+1}")
+        self.num_lbl.config(text=f"#{idx + 1}")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -414,11 +399,19 @@ class App(tk.Tk):
         super().__init__()
         self.title("A4 Photo Grid → DOCX Generator")
         self.configure(bg="#1e1e1e")
-        self.minsize(720, 600)
+        self.minsize(420, 500)
         self.resizable(True, True)
 
         self.image_paths: list = []
         self.cards:       list = []
+
+        # drag state
+        self._drag_card          = None
+        self._drag_orig_index    = None
+        self._drag_target_index  = None
+        self._drag_grab_offset_x = 0
+        self._drag_grab_offset_y = 0
+        self._drag_placeholder   = None
 
         self._build_ui()
         self._check_deps()
@@ -431,7 +424,9 @@ class App(tk.Tk):
             self.status_var.set(f"⚠ Missing: {', '.join(missing)} — click Install")
             self.install_btn.config(state="normal")
 
+    # ── UI layout ─────────────────────────────────────────────────────────────
     def _build_ui(self):
+        # ── toolbar ──────────────────────────────────────────────────────────
         toolbar = tk.Frame(self, bg="#252525", pady=6)
         toolbar.pack(fill="x", side="top")
 
@@ -457,6 +452,7 @@ class App(tk.Tk):
             state="disabled", **btn)
         self.install_btn.pack(side="right", padx=2)
 
+        # ── layout selector ──────────────────────────────────────────────────
         layout_bar = tk.Frame(self, bg="#1e1e1e", pady=5)
         layout_bar.pack(fill="x", padx=10)
 
@@ -482,6 +478,7 @@ class App(tk.Tk):
                          lambda e: (self._refresh_count(),
                                     self._update_layout_hint()))
 
+        # ── paste-path bar ───────────────────────────────────────────────────
         path_bar = tk.Frame(self, bg="#1e1e1e", pady=2)
         path_bar.pack(fill="x", padx=10)
 
@@ -502,6 +499,7 @@ class App(tk.Tk):
 
         ttk.Separator(self, orient="horizontal").pack(fill="x", pady=4)
 
+        # ── info row ─────────────────────────────────────────────────────────
         info_row = tk.Frame(self, bg="#1e1e1e")
         info_row.pack(fill="x", padx=12)
 
@@ -514,24 +512,29 @@ class App(tk.Tk):
                  bg="#1e1e1e", fg="#555555",
                  font=("Arial", 8)).pack(side="right")
 
+        # ── scrollable responsive card grid ───────────────────────────────────
         list_frame = tk.Frame(self, bg="#1e1e1e")
         list_frame.pack(fill="both", expand=True, padx=10, pady=4)
 
-        canvas = tk.Canvas(list_frame, bg="#1e1e1e", highlightthickness=0)
+        self._canvas = tk.Canvas(list_frame, bg="#1e1e1e", highlightthickness=0)
         scrollbar = ttk.Scrollbar(list_frame, orient="vertical",
-                                  command=canvas.yview)
-        self.card_container = tk.Frame(canvas, bg="#1e1e1e")
-        self.card_container.bind(
-            "<Configure>",
-            lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
+                                  command=self._canvas.yview)
+        self.card_container = tk.Frame(self._canvas, bg="#1e1e1e")
 
-        canvas.create_window((0, 0), window=self.card_container, anchor="nw")
-        canvas.configure(yscrollcommand=scrollbar.set)
-        canvas.pack(side="left", fill="both", expand=True)
+        self._canvas_window = self._canvas.create_window(
+            (0, 0), window=self.card_container, anchor="nw")
+
+        self._canvas.configure(yscrollcommand=scrollbar.set)
+        self._canvas.pack(side="left", fill="both", expand=True)
         scrollbar.pack(side="right", fill="y")
-        canvas.bind_all("<MouseWheel>",
-                        lambda e: canvas.yview_scroll(-1*(e.delta//120), "units"))
-        self._canvas = canvas
+
+        # Resize canvas → stretch container width + re-grid cards
+        self._canvas.bind("<Configure>", self._on_canvas_resize)
+
+        # Mousewheel vertical scroll
+        self._canvas.bind_all(
+            "<MouseWheel>",
+            lambda e: self._canvas.yview_scroll(-1 * (e.delta // 120), "units"))
 
         # ── status / progress bar ─────────────────────────────────────────────
         bottom = tk.Frame(self, bg="#1a1a1a", pady=4)
@@ -544,6 +547,33 @@ class App(tk.Tk):
 
         self.progress = ttk.Progressbar(bottom, length=200, mode="determinate")
         self.progress.pack(side="right", padx=10)
+
+    # ── responsive grid management ────────────────────────────────────────────
+
+    def _on_canvas_resize(self, event=None):
+        """Keep card_container as wide as canvas, then re-grid."""
+        if event:
+            self._canvas.itemconfig(self._canvas_window, width=event.width)
+        self.after(10, self._regrid_cards)
+
+    def _current_cols(self):
+        """How many card columns fit in the current canvas width."""
+        cw = self._canvas.winfo_width() or 500
+        slot_w = ImageCard.CARD_W + 8   # card + padx*2
+        return max(1, cw // slot_w)
+
+    def _regrid_cards(self):
+        """Place all (non-dragged) cards left-to-right, wrapping into rows."""
+        cols   = self._current_cols()
+        active = [c for c in self.cards if c is not self._drag_card]
+        for i, card in enumerate(active):
+            row = i // cols
+            col = i % cols
+            card.grid(row=row, column=col, padx=4, pady=4)
+        self.card_container.update_idletasks()
+        self._canvas.configure(scrollregion=self._canvas.bbox("all"))
+
+    # ── image management ──────────────────────────────────────────────────────
 
     def _current_layout(self):
         return LAYOUTS[self.layout_var.get()]
@@ -588,10 +618,12 @@ class App(tk.Tk):
 
     def _add_card(self, path: str, idx: int):
         card = ImageCard(self.card_container, path, idx,
-                         on_drag_end=self._on_drag_end,
+                         on_drag_start=self._on_card_drag_start,
+                         on_drag_move=self._on_card_drag_move,
+                         on_drag_end=self._on_card_drag_end,
                          on_delete=self._delete_card)
-        card.pack(fill="x", padx=4, pady=3)
         self.cards.append(card)
+        self._regrid_cards()
 
     def _delete_card(self, card):
         idx = self.cards.index(card)
@@ -600,6 +632,7 @@ class App(tk.Tk):
         card.destroy()
         for i, c in enumerate(self.cards):
             c.set_index(i)
+        self._regrid_cards()
         self._refresh_count()
 
     def _clear_all(self):
@@ -625,31 +658,119 @@ class App(tk.Tk):
                  f"{pages} A4 page{'s' if pages>1 else ''} "
                  f"({per_page}/page)")
 
-    def _on_drag_end(self, card, release_y_root: int):
-        src_idx    = self.cards.index(card)
-        target_idx = src_idx
+    # ── drag-and-drop (2-D responsive grid) ───────────────────────────────────
 
-        for i, c in enumerate(self.cards):
-            try:
-                cy = c.winfo_rooty()
-                ch = c.winfo_height()
-                if cy <= release_y_root <= cy + ch:
-                    target_idx = i
-                    break
-            except Exception:
-                pass
+    def _on_card_drag_start(self, card, grab_x, grab_y):
+        """Detach card from grid so it can float freely under the cursor."""
+        idx = self.cards.index(card)
+        self._drag_card          = card
+        self._drag_orig_index    = idx
+        self._drag_target_index  = idx
+        self._drag_grab_offset_x = grab_x
+        self._drag_grab_offset_y = grab_y
 
-        if target_idx == src_idx:
+        # Capture screen position before removing from grid
+        # in_= must be the card's direct parent (card_container)
+        abs_x = card.winfo_rootx() - self.card_container.winfo_rootx()
+        abs_y = card.winfo_rooty() - self.card_container.winfo_rooty()
+
+        # Highlighted placeholder gap at the vacated slot
+        self._drag_placeholder = tk.Frame(
+            self.card_container,
+            bg="#161616",
+            width=ImageCard.CARD_W, height=ImageCard.CARD_H,
+            highlightbackground="#f0c040", highlightthickness=2)
+
+        card.grid_forget()
+        self._relayout_with_placeholder()
+
+        # Float the card above everything, placed relative to its direct parent
+        card.lift()
+        card.place(in_=self.card_container, x=abs_x, y=abs_y)
+
+    def _on_card_drag_move(self, card, mouse_x_root, mouse_y_root):
+        """Move floating card and live-update placeholder position."""
+        if self._drag_card is None:
             return
 
-        self.image_paths.insert(target_idx, self.image_paths.pop(src_idx))
-        self.cards.insert(target_idx, self.cards.pop(src_idx))
+        rel_x = mouse_x_root - self.card_container.winfo_rootx() - self._drag_grab_offset_x
+        rel_y = mouse_y_root - self.card_container.winfo_rooty() - self._drag_grab_offset_y
+        card.place_configure(x=rel_x, y=rel_y)
 
-        for c in self.cards:
-            c.pack_forget()
+        new_idx = self._compute_grid_drop_index(mouse_x_root, mouse_y_root)
+        if new_idx != self._drag_target_index:
+            self._drag_target_index = new_idx
+            self._relayout_with_placeholder()
+
+    def _compute_grid_drop_index(self, mouse_x_root, mouse_y_root):
+        """Return insertion index for the current mouse position over the grid."""
+        cols   = self._current_cols()
+        slot_w = ImageCard.CARD_W + 8
+        slot_h = ImageCard.CARD_H + 8
+
+        # Relative to card_container (already accounts for canvas scroll offset)
+        cx = self.card_container.winfo_rootx()
+        cy = self.card_container.winfo_rooty()
+        rel_x = mouse_x_root - cx
+        rel_y = mouse_y_root - cy
+
+        col = max(0, min(cols - 1, int(rel_x // slot_w)))
+        row = max(0, int(rel_y // slot_h))
+        idx = row * cols + col
+
+        others = [c for c in self.cards if c is not self._drag_card]
+        return min(idx, len(others))
+
+    def _relayout_with_placeholder(self):
+        """Re-grid non-dragged cards, inserting placeholder at target slot."""
+        cols   = self._current_cols()
+        others = [c for c in self.cards if c is not self._drag_card]
+
+        for c in others:
+            c.grid_forget()
+        if self._drag_placeholder:
+            self._drag_placeholder.grid_forget()
+
+        seq = others[:]
+        seq.insert(self._drag_target_index, self._drag_placeholder)
+
+        for i, w in enumerate(seq):
+            if w:
+                row = i // cols
+                col = i % cols
+                w.grid(row=row, column=col, padx=4, pady=4)
+
+        self.card_container.update_idletasks()
+        self._canvas.configure(scrollregion=self._canvas.bbox("all"))
+
+    def _on_card_drag_end(self, card, mouse_x_root, mouse_y_root):
+        """Commit new order and restore normal grid layout."""
+        if self._drag_card is None:
+            return
+
+        orig_idx  = self._drag_orig_index
+        final_idx = self._drag_target_index
+
+        self.image_paths.insert(final_idx, self.image_paths.pop(orig_idx))
+        self.cards.insert(final_idx, self.cards.pop(orig_idx))
+
+        if self._drag_placeholder:
+            self._drag_placeholder.destroy()
+            self._drag_placeholder = None
+
+        card.place_forget()
+
+        cols = self._current_cols()
         for i, c in enumerate(self.cards):
             c.set_index(i)
-            c.pack(fill="x", padx=4, pady=3)
+            c.grid(row=i // cols, column=i % cols, padx=4, pady=4)
+
+        self._drag_card         = None
+        self._drag_orig_index   = None
+        self._drag_target_index = None
+
+        self.card_container.update_idletasks()
+        self._canvas.configure(scrollregion=self._canvas.bbox("all"))
 
     # ── generate DOCX ─────────────────────────────────────────────────────────
     def _start_generate(self):
@@ -669,7 +790,6 @@ class App(tk.Tk):
         if not out:
             return
 
-        # Ensure .docx extension and Windows-style backslashes
         if not out.lower().endswith(".docx"):
             out += ".docx"
         out = os.path.normpath(out)

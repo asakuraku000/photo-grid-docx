@@ -11,8 +11,9 @@ from tkinter import ttk, filedialog, messagebox
 import os
 import threading
 import math
+from io import BytesIO
 
-# ── Pillow (optional, for thumbnails) ────────────────────────────────────────
+# ── Pillow (optional, for thumbnails + image resizing) ───────────────────────
 try:
     from PIL import Image, ImageTk
     HAS_PIL = True
@@ -36,7 +37,6 @@ except ImportError:
 #  Layout definitions
 # ─────────────────────────────────────────────────────────────────────────────
 
-# label → (cols, rows)  — images per page = cols * rows
 LAYOUTS = {
     "1×1  – Full page":   (1, 1),
     "1×2  – 2 portrait":  (1, 2),
@@ -50,8 +50,12 @@ DEFAULT_LAYOUT = "2×2  – 4 per page"
 
 A4_W_MM   = 210
 A4_H_MM   = 297
-MARGIN_MM = 10   # outer page margin
-GAP_MM    = 3    # gap between cells
+MARGIN_MM = 10
+GAP_MM    = 3
+
+# DPI used when resizing images before embedding.
+# 200 dpi gives sharp prints while keeping file size small.
+EMBED_DPI = 200
 
 
 def cell_dims(cols: int, rows: int):
@@ -79,6 +83,58 @@ def make_thumbnail(path: str):
         oy = (THUMB_SIZE[1] - img.height) // 2
         canvas.paste(img, (ox, oy))
         return ImageTk.PhotoImage(canvas)
+    except Exception:
+        return None
+
+
+def resize_for_embed(img_path: str, cell_w_mm: float, cell_h_mm: float) -> BytesIO | None:
+    """
+    Resize + CENTER-CROP the image so it fills the cell EXACTLY (cover-fit),
+    at EMBED_DPI, then return a JPEG BytesIO buffer.
+
+    This guarantees every photo ends up the exact same cell_w x cell_h size:
+    - no leftover white margin/letterboxing for "short"/odd-aspect photos
+    - no overflow into the row below for tall/portrait photos
+    so all cells stay pantay-pantay regardless of the original photo shape.
+
+    Returns None if PIL is unavailable or on any error (caller falls back).
+    """
+    if not HAS_PIL:
+        return None
+    try:
+        target_w = max(1, int(round(cell_w_mm / 25.4 * EMBED_DPI)))
+        target_h = max(1, int(round(cell_h_mm / 25.4 * EMBED_DPI)))
+
+        with Image.open(img_path) as img:
+            # Respect EXIF orientation (phone photos are often stored
+            # "sideways" with rotation metadata — without this, some photos
+            # come out unexpectedly tall/short after resizing).
+            try:
+                from PIL import ImageOps
+                img = ImageOps.exif_transpose(img)
+            except Exception:
+                pass
+
+            if img.mode not in ("RGB", "L"):
+                img = img.convert("RGB")
+
+            src_w, src_h = img.size
+            # Scale so the image fully COVERS the target box, then crop the
+            # overhang from the center — this is what removes both the
+            # margin (contain-fit) and the overflow (width-only stretch).
+            scale  = max(target_w / src_w, target_h / src_h)
+            new_w  = max(target_w, int(math.ceil(src_w * scale)))
+            new_h  = max(target_h, int(math.ceil(src_h * scale)))
+            img    = img.resize((new_w, new_h), Image.LANCZOS)
+
+            left = (new_w - target_w) // 2
+            top  = (new_h - target_h) // 2
+            img  = img.crop((left, top, left + target_w, top + target_h))
+
+            buf = BytesIO()
+            img.save(buf, format="JPEG", quality=85, optimize=True)
+            buf.seek(0)
+            return buf
     except Exception:
         return None
 
@@ -113,7 +169,7 @@ def set_cell_margins(cell, top=0, start=0, bottom=0, end=0):
 
 
 def set_table_borders(table, color="FFFFFF", size=0):
-    tbl  = table._tbl
+    tbl   = table._tbl
     tblPr = tbl.find(qn("w:tblPr"))
     if tblPr is None:
         tblPr = OxmlElement("w:tblPr")
@@ -136,16 +192,31 @@ def set_row_height(row, height_mm):
         trPr = OxmlElement("w:trPr")
         tr.insert(0, trPr)
     trHeight = OxmlElement("w:trHeight")
-    # convert mm → twips (1 mm ≈ 56.69 twips)
     twips = int(height_mm * 56.69)
-    trHeight.set(qn("w:val"),  str(twips))
+    trHeight.set(qn("w:val"),   str(twips))
     trHeight.set(qn("w:hRule"), "exact")
     trPr.append(trHeight)
+
+
+def set_row_cant_split(row):
+    """Prevent a table row from being split across two pages, so the whole
+    grid for a page is always kept together as one block."""
+    tr   = row._tr
+    trPr = tr.find(qn("w:trPr"))
+    if trPr is None:
+        trPr = OxmlElement("w:trPr")
+        tr.insert(0, trPr)
+    trPr.append(OxmlElement("w:cantSplit"))
 
 
 def build_docx(image_paths: list, output_path: str,
                cols: int = 2, rows: int = 2,
                progress_cb=None, done_cb=None):
+    """
+    Build a DOCX with images in a cols×rows A4 grid.
+    Images are resized to cell dimensions before embedding so the file stays
+    small and memory usage stays low even for 40+ photos.
+    """
     if not HAS_DOCX:
         if done_cb:
             done_cb("python-docx not installed. Run: pip install python-docx")
@@ -164,12 +235,13 @@ def build_docx(image_paths: list, output_path: str,
         style = doc.styles["Normal"]
         style.paragraph_format.space_before = Pt(0)
         style.paragraph_format.space_after  = Pt(0)
-        style.paragraph_format.line_spacing = Pt(12)
 
         cell_w, cell_h = cell_dims(cols, rows)
         per_page       = cols * rows
         total          = len(image_paths)
         num_pages      = math.ceil(total / per_page)
+
+        done_count = 0  # tracks images fully processed for progress
 
         for page_idx in range(num_pages):
             chunk = image_paths[page_idx * per_page : (page_idx + 1) * per_page]
@@ -177,55 +249,66 @@ def build_docx(image_paths: list, output_path: str,
             table = doc.add_table(rows=rows, cols=cols)
             table.alignment = WD_TABLE_ALIGNMENT.CENTER
             set_table_borders(table)
-            
-            table.allow_autofit = False
 
             for col_obj in table.columns:
                 col_obj.width = Mm(cell_w)
-
             for row_obj in table.rows:
                 set_row_height(row_obj, cell_h)
+                set_row_cant_split(row_obj)
+
+            # Force this table onto a fresh page instead of inserting a
+            # manual page-break paragraph after the previous table. A manual
+            # break paragraph needs its own line of space; since the table
+            # already fills the whole usable page height, that paragraph had
+            # nowhere to go and was pushed onto its own page by itself,
+            # producing a stray blank page after every table. Setting
+            # page_break_before on the first cell's paragraph instead costs
+            # no extra vertical space, so no blank page is created.
+            if page_idx > 0:
+                table.cell(0, 0).paragraphs[0].paragraph_format.page_break_before = True
 
             for i, img_path in enumerate(chunk):
                 r_idx = i // cols
                 c_idx = i % cols
                 cell  = table.cell(r_idx, c_idx)
-                
-                cell.width = Mm(cell_w)
                 cell.vertical_alignment = WD_ALIGN_VERTICAL.CENTER
                 set_cell_margins(cell, 0, 0, 0, 0)
 
                 para = cell.paragraphs[0]
                 para.alignment = WD_ALIGN_PARAGRAPH.CENTER
-                
-                para.paragraph_format.space_before = Pt(0)
-                para.paragraph_format.space_after  = Pt(0)
-                para.paragraph_format.left_indent  = Pt(0)
-                para.paragraph_format.right_indent = Pt(0)
-                
                 run  = para.add_run()
 
                 if os.path.isfile(img_path):
-                    run.add_picture(img_path, width=Mm(cell_w * 0.96))
+                    # Resize + center-crop image to the EXACT cell size
+                    # before embedding (cover-fit). This keeps memory low
+                    # and file size manageable for 40+ photos, and makes
+                    # every photo render at identical, non-distorted size.
+                    buf = resize_for_embed(img_path, cell_w, cell_h)
+                    if buf:
+                        run.add_picture(buf, width=Mm(cell_w), height=Mm(cell_h))
+                    else:
+                        # PIL unavailable — embed original, forcing it to
+                        # the cell box so it at least can't overflow.
+                        run.add_picture(img_path, width=Mm(cell_w), height=Mm(cell_h))
 
+                done_count += 1
                 if progress_cb:
-                    progress_cb(int((page_idx * per_page + i + 1) / total * 90))
+                    # Reserve 0-85 % for image embedding, 85-95 for save
+                    pct = int(done_count / total * 85)
+                    progress_cb(pct)
 
+            # fill empty trailing cells
             for i in range(len(chunk), per_page):
                 r_idx = i // cols
                 c_idx = i % cols
                 cell  = table.cell(r_idx, c_idx)
-                cell.width = Mm(cell_w)
                 set_cell_margins(cell, 0, 0, 0, 0)
 
-            if page_idx < num_pages - 1:
-                pb_para = doc.add_paragraph()
-                pb_para.paragraph_format.space_before = Pt(0)
-                pb_para.paragraph_format.space_after  = Pt(0)
-                pb_para.add_run().add_break(WD_BREAK.PAGE)
+            # (page break to the next table is now handled via
+            # page_break_before on that table's first cell — see above)
 
         if progress_cb:
-            progress_cb(95)
+            progress_cb(90)
 
         doc.save(output_path)
 
@@ -237,6 +320,7 @@ def build_docx(image_paths: list, output_path: str,
     except Exception as exc:
         if done_cb:
             done_cb(str(exc))
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 #  Draggable image card widget
@@ -253,7 +337,6 @@ class ImageCard(tk.Frame):
         self.on_delete   = on_delete
         self._drag_start_y = 0
 
-        # thumbnail
         self.thumb = make_thumbnail(path)
         if self.thumb:
             img_lbl = tk.Label(self, image=self.thumb, bg="#2b2b2b")
@@ -262,7 +345,6 @@ class ImageCard(tk.Frame):
             tk.Label(self, text="🖼", font=("Arial", 28), bg="#2b2b2b",
                      fg="#aaaaaa").pack(side="left", padx=8, pady=4)
 
-        # info
         info = tk.Frame(self, bg="#2b2b2b")
         info.pack(side="left", fill="both", expand=True, padx=4)
 
@@ -281,7 +363,6 @@ class ImageCard(tk.Frame):
                  bg="#2b2b2b", fg="#888888",
                  wraplength=200, justify="left").pack(anchor="w")
 
-        # right side: delete + drag handle
         right = tk.Frame(self, bg="#2b2b2b")
         right.pack(side="right", padx=6, pady=4)
 
@@ -294,7 +375,6 @@ class ImageCard(tk.Frame):
         tk.Label(right, text="⠿", font=("Arial", 18),
                  bg="#2b2b2b", fg="#555555").pack(side="top")
 
-        # drag bindings
         drag_targets = [self, info]
         if self.thumb:
             drag_targets.append(img_lbl)
@@ -343,7 +423,6 @@ class App(tk.Tk):
         self._build_ui()
         self._check_deps()
 
-    # ── dependency check ─────────────────────────────────────────────────────
     def _check_deps(self):
         missing = []
         if not HAS_PIL:   missing.append("Pillow")
@@ -352,9 +431,7 @@ class App(tk.Tk):
             self.status_var.set(f"⚠ Missing: {', '.join(missing)} — click Install")
             self.install_btn.config(state="normal")
 
-    # ── UI ───────────────────────────────────────────────────────────────────
     def _build_ui(self):
-        # ── toolbar ──────────────────────────────────────────────────────────
         toolbar = tk.Frame(self, bg="#252525", pady=6)
         toolbar.pack(fill="x", side="top")
 
@@ -380,7 +457,6 @@ class App(tk.Tk):
             state="disabled", **btn)
         self.install_btn.pack(side="right", padx=2)
 
-        # ── layout dropdown ───────────────────────────────────────────────────
         layout_bar = tk.Frame(self, bg="#1e1e1e", pady=5)
         layout_bar.pack(fill="x", padx=10)
 
@@ -396,7 +472,6 @@ class App(tk.Tk):
             font=("Arial", 10),
             width=22)
         layout_menu.pack(side="left", padx=8)
-        layout_menu.bind("<<ComboboxSelected>>", lambda e: self._refresh_count())
 
         self.layout_hint = tk.Label(layout_bar, text="",
                                     bg="#1e1e1e", fg="#888888",
@@ -407,7 +482,6 @@ class App(tk.Tk):
                          lambda e: (self._refresh_count(),
                                     self._update_layout_hint()))
 
-        # ── path input bar ────────────────────────────────────────────────────
         path_bar = tk.Frame(self, bg="#1e1e1e", pady=2)
         path_bar.pack(fill="x", padx=10)
 
@@ -426,10 +500,8 @@ class App(tk.Tk):
                   relief="flat", padx=8, font=("Arial", 9, "bold"),
                   command=self._add_from_entry).pack(side="left")
 
-        # ── separator ─────────────────────────────────────────────────────────
         ttk.Separator(self, orient="horizontal").pack(fill="x", pady=4)
 
-        # ── count / hint row ──────────────────────────────────────────────────
         info_row = tk.Frame(self, bg="#1e1e1e")
         info_row.pack(fill="x", padx=12)
 
@@ -442,7 +514,6 @@ class App(tk.Tk):
                  bg="#1e1e1e", fg="#555555",
                  font=("Arial", 8)).pack(side="right")
 
-        # ── scrollable card list ──────────────────────────────────────────────
         list_frame = tk.Frame(self, bg="#1e1e1e")
         list_frame.pack(fill="both", expand=True, padx=10, pady=4)
 
@@ -474,7 +545,6 @@ class App(tk.Tk):
         self.progress = ttk.Progressbar(bottom, length=200, mode="determinate")
         self.progress.pack(side="right", padx=10)
 
-    # ── layout helpers ────────────────────────────────────────────────────────
     def _current_layout(self):
         return LAYOUTS[self.layout_var.get()]
 
@@ -485,7 +555,6 @@ class App(tk.Tk):
         self.layout_hint.config(
             text=f"{per} image{'s' if per>1 else ''}/page  •  ~{w:.0f}×{h:.0f} mm each")
 
-    # ── card management ───────────────────────────────────────────────────────
     def _add_images(self):
         paths = filedialog.askopenfilenames(
             title="Select Images",
@@ -556,7 +625,6 @@ class App(tk.Tk):
                  f"{pages} A4 page{'s' if pages>1 else ''} "
                  f"({per_page}/page)")
 
-    # ── drag-to-reorder ───────────────────────────────────────────────────────
     def _on_drag_end(self, card, release_y_root: int):
         src_idx    = self.cards.index(card)
         target_idx = src_idx
@@ -601,19 +669,25 @@ class App(tk.Tk):
         if not out:
             return
 
+        # Ensure .docx extension and Windows-style backslashes
+        if not out.lower().endswith(".docx"):
+            out += ".docx"
+        out = os.path.normpath(out)
+
         cols, rows = self._current_layout()
         self.progress["value"] = 0
-        self.status_var.set(f"Building DOCX ({cols}×{rows})…")
+        self.status_var.set(f"Building DOCX ({cols}×{rows})… 0%")
         self.update_idletasks()
 
         paths_copy = list(self.image_paths)
+        saved_path = out
 
         def _run():
             build_docx(
-                paths_copy, out,
+                paths_copy, saved_path,
                 cols=cols, rows=rows,
                 progress_cb=self._update_progress,
-                done_cb=self._on_done)
+                done_cb=lambda err: self._on_done(err, saved_path))
 
         threading.Thread(target=_run, daemon=True).start()
 
@@ -622,19 +696,38 @@ class App(tk.Tk):
 
     def _set_progress(self, pct: int):
         self.progress["value"] = pct
-        self.status_var.set(f"Processing… {pct}%")
+        if pct < 90:
+            self.status_var.set(f"Processing images… {pct}%")
+        elif pct < 100:
+            self.status_var.set(f"Saving DOCX file… {pct}%")
+        else:
+            self.status_var.set("✅ Done!")
         self.update_idletasks()
 
-    def _on_done(self, err):
+    def _on_done(self, err, saved_path=None):
         if err:
             self.after(0, lambda: messagebox.showerror("Error", str(err)))
             self.after(0, lambda: self.status_var.set("❌ Failed"))
         else:
-            self.after(0, lambda: messagebox.showinfo(
-                "Done!", "DOCX generated successfully! ✅"))
-            self.after(0, lambda: self.status_var.set("✅ Done!"))
+            self.after(0, lambda: self._open_file(saved_path))
 
-    # ── install deps ──────────────────────────────────────────────────────────
+    def _open_file(self, path):
+        """Show success popup, open the file in Word, highlight in Explorer."""
+        import subprocess, sys
+        messagebox.showinfo("Done!", f"DOCX generated successfully!\n\n{path}")
+        try:
+            if sys.platform == "win32":
+                os.startfile(path)
+                subprocess.Popen(["explorer", "/select,", path])
+            elif sys.platform == "darwin":
+                subprocess.Popen(["open", path])
+            else:
+                subprocess.Popen(["xdg-open", path])
+        except Exception as e:
+            messagebox.showwarning(
+                "Could not open file",
+                f"File saved but could not open automatically:\n{path}\n\n{e}")
+
     def _install_deps(self):
         self.status_var.set("Installing dependencies…")
         self.update_idletasks()
